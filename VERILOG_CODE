@@ -1,0 +1,291 @@
+`timescale 1ns/1ps
+module cordic_cos_log_32(
+input clk,
+input rst_n,
+input start, // start signal to begin computation
+input mode, // mode select: 0 = cosine, 1 = logarithm
+input signed [31:0] din, // input value: if mode==0, angle (Q1.31 radians); if mode==1, argument for ln() in Q1.31
+output reg signed [31:0] result, // output: cosine or ln(din) in Q1.31 format
+output reg done // high when computation is complete
+);
+// Number of iterations: adjust as needed.
+localparam ITER = 16;
+// Scaling factor for cosine branch (pre-scaled K value, where K ≈ 0.607252935).
+localparam signed [31:0] K = 32'sd1304381789; // 0.607252935 * 2^31
+// Constant "1" in Q1.31 format (i.e. 2^31).
+localparam signed [31:0] one = 32'sd2147483648;
+//----------------------------------------------------------------------------
+// Functions returning lookup table constants.
+//----------------------------------------------------------------------------
+// Function for arctan(2^-i) values in Q1.31 for i = 0 to 15.
+function automatic signed [31:0] atan_val (input integer i);
+begin
+case(i)
+0: atan_val = 32'sd1686629713; // arctan(2^0) ≈ 0.785398163
+1: atan_val = 32'sd995203255; // arctan(2^-1) ≈ 0.463647609
+2: atan_val = 32'sd524325399; // arctan(2^-2) ≈ 0.244978663
+3: atan_val = 32'sd266665216; // arctan(2^-3) ≈ 0.124354995
+4: atan_val = 32'sd134217728; // arctan(2^-4) ≈ 0.06241881
+5: atan_val = 32'sd67108864; // arctan(2^-5) ≈ 0.03123983
+6: atan_val = 32'sd33554432; // arctan(2^-6) ≈ 0.01562373
+7: atan_val = 32'sd16777216; // arctan(2^-7) ≈ 0.00781234
+8: atan_val = 32'sd8388608; // arctan(2^-8) ≈ 0.00390623
+9: atan_val = 32'sd4194304; // arctan(2^-9)
+10: atan_val = 32'sd2097152; // arctan(2^-10)
+11: atan_val = 32'sd1048576; // arctan(2^-11)
+12: atan_val = 32'sd524288; // arctan(2^-12)
+13: atan_val = 32'sd262144; // arctan(2^-13)
+14: atan_val = 32'sd131072; // arctan(2^-14)
+15: atan_val = 32'sd65536; // arctan(2^-15)
+default: atan_val = 0;
+endcase
+end
+endfunction
+// Function for atanh(2^-i) values in Q1.31 for i = 1 to 15.
+// Note: atanh(2^0) is not used; we define index 0 as 0 to simplify the code.
+function automatic signed [31:0] atanh_val (input integer i);
+begin
+case(i)
+0: atanh_val = 32'sd0;
+1: atanh_val = 32'sd1181110399; // atanh(2^-1) ≈ 0.5493061443
+2: atanh_val = 32'sd548903680; // atanh(2^-2) ≈ 0.2554128119
+3: atanh_val = 32'sd270532608; // atanh(2^-3) ≈ 0.1256572141
+4: atanh_val = 32'sd134217728; // atanh(2^-4) ≈ 0.0625815715
+5: atanh_val = 32'sd67108864; // atanh(2^-5) ≈ 0.0312601785
+6: atanh_val = 32'sd33554432; // atanh(2^-6) ≈ 0.0156262711
+7: atanh_val = 32'sd16777216; // atanh(2^-7) ≈ 0.0078126589
+8: atanh_val = 32'sd8388608; // atanh(2^-8) ≈ 0.0039062691
+9: atanh_val = 32'sd4194304; // atanh(2^-9)
+10: atanh_val = 32'sd2097152; // atanh(2^-10)
+11: atanh_val = 32'sd1048576; // atanh(2^-11)
+12: atanh_val = 32'sd524288; // atanh(2^-12)
+13: atanh_val = 32'sd262144; // atanh(2^-13)
+14: atanh_val = 32'sd131072; // atanh(2^-14)
+15: atanh_val = 32'sd65536; // atanh(2^-15)
+default: atanh_val = 0;
+endcase
+end
+endfunction
+//----------------------------------------------------------------------------
+// Internal Registers
+//----------------------------------------------------------------------------
+reg signed [31:0] x, y, z;
+reg [4:0] iteration;
+reg busy;
+// Temporary registers for next-iteration values.
+reg signed [31:0] x_new, y_new, z_new;
+//----------------------------------------------------------------------------
+// Combinatorial Update Logic
+//----------------------------------------------------------------------------
+always @* begin
+if (mode == 1'b0) begin
+// ----------------------------
+// Cosine Calculation (Rotation Mode)
+// ----------------------------
+if (z >= 0) begin
+// Rotate by negative angle: subtract arctan value.
+x_new = x - (y >>> iteration);
+y_new = y + (x >>> iteration);
+z_new = z - atan_val(iteration);
+end else begin
+// Rotate by positive angle: add arctan value.
+x_new = x + (y >>> iteration);
+y_new = y - (x >>> iteration);
+z_new = z + atan_val(iteration);
+end
+end else begin
+// ----------------------------
+// Logarithm Calculation (Hyperbolic Vectoring Mode)
+// ----------------------------
+if (y < 0) begin
+x_new = x + (y >>> iteration);
+y_new = y + (x >>> iteration);
+z_new = z - atanh_val(iteration);
+end else begin
+x_new = x - (y >>> iteration);
+y_new = y - (x >>> iteration);
+z_new = z + atanh_val(iteration);
+end
+end
+end
+//----------------------------------------------------------------------------
+// Sequential Processing: FSM for Iterative Calculation
+//----------------------------------------------------------------------------
+always @(posedge clk or negedge rst_n) begin
+if (!rst_n) begin
+x <= 0;
+y <= 0;
+z <= 0;
+iteration <= 0;
+busy <= 0;
+done <= 0;
+result <= 0;
+end else begin
+if (start && !busy) begin
+busy <= 1;
+done <= 0;
+if (mode == 1'b0) begin
+// Cosine initialization.
+iteration <= 0;
+x <= K; // Pre-scale by K for cosine.
+y <= 0;
+z <= din; // Input angle in Q1.31.
+end else begin
+// Logarithm initialization.
+iteration <= 1; // Start at iteration 1.
+x <= (din + one) >>> 1; // x0 = (value + 1)/2
+y <= (din - one) >>> 1; // y0 = (value - 1)/2
+z <= 0;
+end
+end else if (busy) begin
+if (iteration < ITER) begin
+// Perform one CORDIC iteration per clock cycle.
+x <= x_new;
+y <= y_new;
+z <= z_new;
+iteration <= iteration + 1;
+end else begin
+busy <= 0;
+done <= 1;
+if (mode == 1'b0)
+result <= x;
+else
+result <= z << 1; // ln(din) = 2*z
+end
+end else begin
+done <= 0;
+end
+end
+end
+endmodule
+TESTBENCH:
+`timescale 1ns/1ps
+module tb_cordic_cos_log_32;
+// DUT ports
+reg clk;
+reg rst_n;
+reg start;
+reg mode; // 0: cosine, 1: logarithm
+reg signed [31:0] din;
+wire signed [31:0] result;
+wire done;
+// Instantiate the DUT
+cordic_cos_log_32 dut (
+.clk (clk),
+.rst_n (rst_n),
+.start (start),
+.mode (mode),
+.din (din),
+.result(result),
+.done (done)
+);
+// Clock generation: 10 ns period
+initial begin
+clk = 0;
+forever #5 clk = ~clk;
+end
+// Test sequence
+initial begin
+// Initialize signals
+rst_n = 0;
+start = 0;
+mode = 0;
+din = 0;
+#20;
+rst_n = 1;
+//==========================================
+// Cosine Mode Test Cases
+//==========================================
+$display("\n--- Cosine Mode Tests ---");
+// Test 1: Angle = 0 rad
+mode = 1'b0;
+din = 32'sd0;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Cosine Test 1: Angle = %d, Cosine = %d", din, result);
+#20;
+// Test 2: Angle = +45° (≈0.785398163 rad)
+// 0.785398163 * 2^31 ≈ 1686629713
+mode = 1'b0;
+din = 32'sd1234567890;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Cosine Test 2: Angle = %d, Cosine = %d", din, result);
+#20;
+// Test 3: Angle = -45° (≈-0.785398163 rad)
+mode = 1'b0;
+din = -32'sd1686629713;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Cosine Test 3: Angle = %d, Cosine = %d", din, result);
+#20;
+// Test 4: Angle = +90° (≈1.570796327 rad)
+// 1.570796327 * 2^31 ≈ 3377699723
+mode = 1'b0;
+din = 32'sd3377699723;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Cosine Test 4: Angle = %d, Cosine = %d", din, result);
+#20;
+// Test 5: Angle = -90° (≈-1.570796327 rad)
+$display("\n--- Logarithm Mode Tests ---");
+// For logarithm mode, the input 'din' represents a positive number in Q1.31 format.
+// The Q1.31 representation of 1.0 is 2147483648. In these tests, we use:
+// Test 1: Input = 0.5 => 0.5 * 2147483648 = 1073741824
+mode = 1'b1;
+din = 32'sd1073741824;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Log Test 1: Input = %d, ln = %d", din, result);
+#20;
+// Test 2: Input = 0.75 => 0.75 * 2147483648 = 1610612736
+mode = 1'b1;
+din = 32'sd1610612736;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Log Test 2: Input = %d, ln = %d", din, result);
+#20;
+// Test 3: Input = 1.0 => 1.0 * 2147483648 = 2147483648
+mode = 1'b1;
+din = 32'sd2147483648;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Log Test 3: Input = %d, ln = %d", din, result);
+#20;
+// Test 4: Input = 0.875 => 0.875 * 2147483648 ≈ 1879048192
+mode = 1'b1;
+din = 32'sd1879048192;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Log Test 4: Input = %d, ln = %d", din, result);
+#20;
+// Test 5: Input = 0.625 => 0.625 * 2147483648 = 1342177280
+mode = 1'b1;
+din = 32'sd1342177280;
+start = 1;
+#10;
+start = 0;
+wait(done);
+$display("Log Test 5: Input = %d, ln = %d", din, result);
+#20;
+$display("\nTestbench completed.");
+#50;
+$finish;
+end
+endmodule
